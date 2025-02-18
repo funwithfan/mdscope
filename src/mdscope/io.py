@@ -10,7 +10,7 @@ def extract_lammps_data(filename, columns=None, filters=None, sort_by=None):
         columns (list, optional): List of column names to extract. Defaults to all columns.
         filters (dict, optional): Dictionary specifying filters in the format {column: value}.
             Can use tuples (min, max) for range filtering.
-        sort_by (str, optional): Column name to sort the data by. Defaults to "id".
+        sort_by (str, optional): Column name to sort the data by.
     
     Returns:
         tuple: (pd.DataFrame with extracted data, np.array with box size limits (3x2))
@@ -36,8 +36,7 @@ def extract_lammps_data(filename, columns=None, filters=None, sort_by=None):
     data_lines = lines[start_index:]
     
     # Read data into a DataFrame
-    # data = pd.read_csv(pd.io.common.StringIO(''.join(data_lines)), delim_whitespace=True, names=column_names)
-    data = pd.read_csv(pd.io.common.StringIO(''.join(data_lines)), sep='\s+', names=column_names)
+    data = pd.read_csv(pd.io.common.StringIO(''.join(data_lines)), sep=r"\s+", names=column_names)
     
     # Use all columns if not specified
     if columns is None:
@@ -60,29 +59,53 @@ def extract_lammps_data(filename, columns=None, filters=None, sort_by=None):
             data = data.sort_values(by=sort_by)
         else:
             print('Warning: sort_by is not in data. Returning unsorted data.')
+            
     return data, box_limits
 
-def write_lammps_dump(filename, data, box_limits, columns=None):
+
+def write_lammps_dump(filename, timestep, num_atoms, box_limits, df, order):
     """
-    Write data to a LAMMPS dump file.
-    
+    Write a LAMMPS dump file.
+
     Parameters:
-        filename (str): Path to the LAMMPS dump file.
-        data (pd.DataFrame): Data to write to the file.
-        box_limits (np.array): Box size limits (3x2).
-        columns (list, optional): List of column names to include in the dump file. Defaults to all columns.
+        filename (str): Output file name.
+        timestep (int): Timestep number.
+        num_atoms (int): Number of atoms.
+        box_limits (numpy.ndarray): 3x2 array of box boundaries.
+        df (pandas.DataFrame): DataFrame containing atomic data.
+        order (list): Column names in the order they should be written.
     """
+
+    # Ensure `order` is a list
+    if not isinstance(order, list):
+        order = list(order)
+
+    # Validate `box_limits` shape
+    if not (isinstance(box_limits, np.ndarray) and box_limits.shape == (3, 2)):
+        raise ValueError("box_limits must be a (3,2) NumPy array.")
+
+    # Check if all columns in `order` exist in `df`, if not raise an error
+    missing_columns = [col for col in order if col not in df.columns]
+    if missing_columns:
+        raise KeyError(f"DataFrame is missing required columns: {missing_columns}")
+
     with open(filename, 'w') as file:
-        # Write box size limits
+        # Write timestep
+        file.write("ITEM: TIMESTEP\n")
+        file.write(f"{timestep}\n")
+
+        # Write number of atoms
+        file.write("ITEM: NUMBER OF ATOMS\n")
+        file.write(f"{num_atoms}\n")
+
+        # Write box limits
         file.write("ITEM: BOX BOUNDS pp pp pp\n")
         for i in range(3):
-            file.write(f"{box_limits[i, 0]:.6f} {box_limits[i, 1]:.6f}\n")
+            file.write(f"{box_limits[i, 0]} {box_limits[i, 1]}\n")
         
-        # Write column names
+        # Write column names in the specified order
         file.write("ITEM: ATOMS ")
-        if columns is None:
-            columns = data.columns
-        file.write(" ".join(columns) + "\n")
-        
-        # Write data
-        data.to_csv(file, sep=' ', header=False, index=False)
+        file.write(' '.join(order) + '\n')
+
+        # Write atomic data with specified column order
+        df.to_csv(file, sep=' ', header=False, index=False, columns=order)
