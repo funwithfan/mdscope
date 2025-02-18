@@ -1,3 +1,5 @@
+"""This module contains functions for reading and writing LAMMPS dump files."""
+
 import numpy as np
 import pandas as pd
 
