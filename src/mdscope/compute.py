@@ -3,6 +3,19 @@
 import numba as nb
 import numpy as np
 
+# Define unit conversion
+kcal_mol2j = 6.9477e-21
+A2m = 1e-10
+e2c = 1.60217663e-19
+a_fs2m_s = 1e5
+g_mol2kg = 1.6611e-27
+
+# Define basic parameters
+kB = 1.380649E-23
+eps_0 = 8.85418782e-12      # F/m, dielectric permittivity
+C = 1 / (4 * np.pi * eps_0) # energy-conversion constant
+dielectric = 1              # dielectric constant
+
 @nb.njit(parallel=True)
 def compute_distance_matrix(particle_positions, box_length):
     """
@@ -140,3 +153,463 @@ def compute_local_fraction(mol_positions, num_mol_1, box_length, cutoff):
     local_fraction = count_num_mol_1 / count_neighbors
 
     return local_fraction
+
+
+@nb.njit()
+def get_mol_ke(mol1_velocities, mol2_velocities, atom_type_single_mol1, atom_type_single_mol2, mass):
+    """
+    Compute the kinetic energy of each molecule.
+    """
+    num_mol1 = mol1_velocities.shape[0]
+    num_mol2 = mol2_velocities.shape[0]
+    num_mol = num_mol1 + num_mol2
+
+    mol_ke = np.zeros(num_mol)
+
+    for i in range(num_mol1):
+        for j in range(mol1_velocities.shape[1]):
+            mol_ke[i] += mass[atom_type_single_mol1[j]] * np.sum(mol1_velocities[i,j,:]**2)
+    
+    for i in range(num_mol2):
+        for j in range(mol2_velocities.shape[1]):
+            mol_ke[i+num_mol1] += mass[atom_type_single_mol2[j]] * np.sum(mol2_velocities[i,j,:]**2)
+
+    mol_ke *= 0.5 * g_mol2kg * a_fs2m_s**2 / kcal_mol2j # unit: kcal_mol
+    return mol_ke
+
+@nb.njit(parallel=True)
+def get_com_velocity(mol_velocities, mol_mass):
+    """
+    Compute the center of mass velocity for each molecule.
+    """
+    num_mol = mol_velocities.shape[0]
+
+    com_velocities = np.zeros((num_mol, 3))
+
+    m = np.sum(mol_mass)
+
+    for i in nb.prange(num_mol):
+        com_velocities[i] = np.sum(mol_velocities[i] * mol_mass[:, np.newaxis], axis=0) / m
+    
+    return com_velocities
+
+@nb.njit()
+def get_com_velocity_vectorized(mol_velocities, mol_mass):
+    """
+    向量化计算多个分子中心的质量速度 (Center-of-Mass Velocity)。
+
+    Parameters:
+    mol_velocities (ndarray): 形状为 (num_mol, num_atoms_per_mol, 3)，表示每个分子的原子速度。
+    mol_mass (ndarray): 形状为 (num_atoms_per_mol,)，表示每个分子的原子质量。
+
+    Returns:
+    ndarray: 形状为 (num_mol, 3)，表示每个分子的中心质量速度。
+    """
+    # 计算总质量（假设所有分子的原子质量相同）
+    total_mass = np.sum(mol_mass)
+
+    # 广播原子质量以匹配速度形状 (num_mol, num_atoms_per_mol, 3)
+    weighted_velocities = mol_velocities * mol_mass[:, np.newaxis]
+
+    # 对每个分子的加权速度求和，并除以总质量
+    com_velocities = np.sum(weighted_velocities, axis=1) / total_mass
+
+    return com_velocities
+
+
+@nb.njit()
+def inter_molecular_pe(mol1_position, mol2_position, mol1_type, mol2_type, eps, sig, q, box_length, cutoff):
+    """
+    Compute the intermolecular potential energy between two molecules.
+    """
+    vdw = 0
+    coul = 0
+
+    num_atom_mol1 = mol1_position.shape[0]
+    num_atom_mol2 = mol2_position.shape[0]
+
+    for i in range(num_atom_mol1):
+        for j in range(num_atom_mol2):
+            r_vec = mol1_position[i, :] - mol2_position[j, :]
+
+            # Apply periodic boundary conditions along each dimension
+            r_vec -= box_length * np.round(r_vec / box_length)
+
+            # Compute the distance
+            r = np.linalg.norm(r_vec)
+
+            if r > cutoff:
+                return 0.0
+            else:
+            # if r < cutoff:
+                # Get the atom types for the interaction
+                type1 = mol1_type[i]
+                type2 = mol2_type[j]
+
+                # Lennard-Jones parameters
+                epsilon = eps[type1, type2]
+                sigma = sig[type1, type2]
+
+                # Lennard-Jones potential
+                r6 = (sigma / r)**6
+                r12 = r6**2
+                vdw += 4 * epsilon * (r12 - r6)
+
+                # Coulombic potential
+                q1 = q[type1]
+                q2 = q[type2] 
+                coul += (C * q1 * q2) / (dielectric * r)
+
+    pe = vdw + coul * e2c * e2c / A2m / kcal_mol2j  # unit: kcal/mol
+    return pe
+
+
+@nb.njit(parallel=True)
+def get_pe_matrix(mol1_positions, mol2_positions, atom_type_single_mol1, atom_type_single_mol2, eps, sig, q, box_length, cutoff):
+    """
+    Compute the potential energy matrix between all pairs of molecules.
+    """
+    num_mol1 = mol1_positions.shape[0]
+    num_mol2 = mol2_positions.shape[0]
+    num_mol = num_mol1 + num_mol2
+
+    pe_matrix = np.zeros((num_mol, num_mol))
+
+    for i in nb.prange(num_mol):  # Parallelized loop
+        if i < num_mol1:
+            mol_i_position = mol1_positions[i]
+            mol_i_atom_type = atom_type_single_mol1
+        else:
+            mol_i_position = mol2_positions[i - num_mol1]
+            mol_i_atom_type = atom_type_single_mol2
+
+        for j in range(i + 1, num_mol):
+            if j < num_mol1:
+                mol_j_position = mol1_positions[j]
+                mol_j_atom_type = atom_type_single_mol1
+            else:
+                mol_j_position = mol2_positions[j - num_mol1]
+                mol_j_atom_type = atom_type_single_mol2
+
+            pe_matrix[i, j] = inter_molecular_pe(mol1_postion=mol_i_position,
+                                                 mol2_postion=mol_j_position,
+                                                 mol1_type=mol_i_atom_type,
+                                                 mol2_type=mol_j_atom_type,
+                                                 eps=eps,
+                                                 sig=sig,
+                                                 q=q,
+                                                 box_length=box_length,
+                                                 cutoff=cutoff)
+            pe_matrix[j, i] = pe_matrix[i, j]  # Enforce symmetry
+
+    return pe_matrix
+
+
+@nb.njit()
+def relative_ke(mol1_velocity, mol2_velocity, mol1_mass, mol2_mass):
+    """
+    Compute the relative kinetic energy between two molecules.
+    """
+    # Total mass of each molecule
+    m1 = np.sum(mol1_mass)
+    m2 = np.sum(mol2_mass)
+
+    # Reduced mass
+    miu = (m1 * m2) / (m1 + m2)
+
+    # Center of mass velocity for each molecule
+    mol1_com_velocity = np.sum(mol1_velocity * mol1_mass[:, np.newaxis], axis=0) / m1
+    mol2_com_velocity = np.sum(mol2_velocity * mol2_mass[:, np.newaxis], axis=0) / m2
+
+    # Relative velocity
+    relative_velocity = mol1_com_velocity - mol2_com_velocity
+
+    # Relative kinetic energy
+    ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * g_mol2kg * a_fs2m_s * a_fs2m_s / kcal_mol2j # unit: kcal_mol
+
+    return ke
+
+@nb.njit(parallel=True, fastmath=True)
+def hill_criterion(mol1_positions, mol2_positions, mol1_velocities, mol2_velocities,
+                   atom_type_single_mol1, atom_type_single_mol2, eps, sig, q, mass,
+                   box_length, cutoff):
+    num_mol1 = mol1_positions.shape[0]
+    num_mol2 = mol2_positions.shape[0]
+    num_mol = num_mol1 + num_mol2
+    # print(num_mol1, num_mol2)
+
+    # Initialize adjacency matrix and potential energy
+    adj_matrix = np.zeros((num_mol, num_mol), dtype=np.bool_)
+    pe_matrix = np.zeros((num_mol, num_mol), dtype=np.float64)
+
+    for i in nb.prange(num_mol):  # Parallelized loop
+        if i < num_mol1:
+            mol_i_atom_type = atom_type_single_mol1
+            mol_i_position = mol1_positions[i]
+            mol_i_velocity = mol1_velocities[i]
+        else:
+            mol_i_atom_type = atom_type_single_mol2
+            mol_i_position = mol2_positions[i - num_mol1]
+            mol_i_velocity = mol2_velocities[i - num_mol1]
+
+        for j in range(i + 1, num_mol):  # Compute upper triangle only
+            if j < num_mol1:
+                mol_j_atom_type = atom_type_single_mol1
+                mol_j_position = mol1_positions[j]
+                mol_j_velocity = mol1_velocities[j]
+            else:
+                mol_j_atom_type = atom_type_single_mol2
+                mol_j_position = mol2_positions[j - num_mol1]
+                mol_j_velocity = mol2_velocities[j - num_mol1]
+
+            # Compute pair potential energy
+            pe = inter_molecular_pe(mol1_position=mol_i_position,
+                                    mol2_position=mol_j_position,
+                                    mol1_type=mol_i_atom_type,
+                                    mol2_type=mol_j_atom_type,
+                                    eps=eps,
+                                    sig=sig,
+                                    q=q,
+                                    box_length=box_length,
+                                    cutoff=cutoff)
+
+            # potential energy
+            pe_matrix[i, j] = pe
+            pe_matrix[j, i] = pe
+
+            # Only consider pairs with attractive interaction (PE < 0)
+            if pe < 0:
+                # Compute relative kinetic energy
+                ke = relative_ke(mol1_velocity=mol_i_velocity,
+                                 mol2_velocity=mol_j_velocity,
+                                 mol1_mass=mass[mol_i_atom_type],
+                                 mol2_mass=mass[mol_j_atom_type])
+
+                # Check Hill criterion
+                if pe + ke < 0:
+                    adj_matrix[i, j] = 1
+                    adj_matrix[j, i] = 1  # Enforce symmetry
+
+    return adj_matrix, pe_matrix
+
+   
+@nb.njit(parallel=True, fastmath=True)
+def hill_criterion2(mol1_positions, mol2_positions, mol1_velocities, mol2_velocities,
+                   atom_type_single_mol1, atom_type_single_mol2, eps, sig, q, mass,
+                   box_length, cutoff):
+    num_mol1 = mol1_positions.shape[0]
+    num_mol2 = mol2_positions.shape[0]
+    num_mol = num_mol1 + num_mol2
+
+    # Total mass of each molecule
+    m1 = np.sum(mass[atom_type_single_mol1])
+    m2 = np.sum(mass[atom_type_single_mol2])
+
+    mol1_com_velocities = get_com_velocity_vectorized(mol1_velocities, mass[atom_type_single_mol1])
+    mol2_com_velocities = get_com_velocity_vectorized(mol2_velocities, mass[atom_type_single_mol2])
+
+    # Initialize adjacency matrix and potential energy
+    adj_matrix = np.zeros((num_mol, num_mol), dtype=np.bool_)
+    pe_matrix = np.zeros((num_mol, num_mol), dtype=np.float64)
+
+    for idx in nb.prange(num_mol * (num_mol - 1) // 2):  # Parallelized loop for the upper triangle
+        i = int(num_mol - 2 - int(np.sqrt(-8*idx + 4*num_mol*(num_mol-1)-7)/2.0 - 0.5))
+        j = int(idx + i + 1 - num_mol*(num_mol-1)/2 + (num_mol-i)*((num_mol-i)-1)/2)
+
+
+        if i < num_mol1:
+            mol_i_atom_type = atom_type_single_mol1
+            mol_i_position = mol1_positions[i]
+            mol_i_com_velocity = mol1_com_velocities[i]
+            mass_i = m1
+        else:
+            mol_i_atom_type = atom_type_single_mol2
+            mol_i_position = mol2_positions[i - num_mol1]
+            mol_i_com_velocity = mol2_com_velocities[i - num_mol1]
+            mass_i = m2
+
+        
+        if j < num_mol1:
+            mol_j_atom_type = atom_type_single_mol1
+            mol_j_position = mol1_positions[j]
+            mol_j_com_velocity = mol1_com_velocities[j]
+            mass_j = m1
+        else:
+            mol_j_atom_type = atom_type_single_mol2
+            mol_j_position = mol2_positions[j - num_mol1]
+            mol_j_com_velocity = mol2_com_velocities[j - num_mol1]
+            mass_j = m2
+
+
+        # Compute pair potential energy
+        pe = inter_molecular_pe(mol1_position=mol_i_position,
+                                mol2_position=mol_j_position,
+                                mol1_type=mol_i_atom_type,
+                                mol2_type=mol_j_atom_type,
+                                eps=eps,
+                                sig=sig,
+                                q=q,
+                                box_length=box_length,
+                                cutoff=cutoff)
+
+        # potential energy
+        pe_matrix[i, j] = pe
+        pe_matrix[j, i] = pe
+
+        # Only consider pairs with attractive interaction (PE < 0)
+        if pe < 0:
+            # Compute relative kinetic energy
+            relative_velocity = mol_i_com_velocity - mol_j_com_velocity # Relative velocity
+            miu = (mass_i * mass_j) / (mass_i + mass_j) # Reduced mass
+            ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * bp.g_mol2kg * bp.a_fs2m_s * bp.a_fs2m_s / bp.kcal_mol2j # Relative kinetic energy, unit: kcal_mol
+
+            # Check Hill criterion
+            if pe + ke < 0:
+                adj_matrix[i, j] = 1
+                adj_matrix[j, i] = 1  # Enforce symmetry
+
+    return adj_matrix, pe_matrix
+
+@nb.njit(parallel=True, fastmath=True)
+def hill_criterion3(mol1_positions, mol2_positions, mol1_velocities, mol2_velocities,
+                   atom_type_single_mol1, atom_type_single_mol2, eps, sig, q, mass,
+                   box_length, cutoff):
+    num_mol1 = mol1_positions.shape[0]
+    num_mol2 = mol2_positions.shape[0]
+    num_mol = num_mol1 + num_mol2
+
+    # Initialize adjacency matrix and potential energy
+    adj_matrix = np.zeros((num_mol, num_mol), dtype=np.bool_)
+    pe_matrix = np.zeros((num_mol, num_mol), dtype=np.float64)
+
+    for idx in nb.prange(num_mol * (num_mol - 1) // 2):  # Parallelized loop for the upper triangle
+
+        i = int(num_mol - 2 - int(np.sqrt(-8*idx + 4*num_mol*(num_mol-1)-7)/2.0 - 0.5))
+        j = int(idx + i + 1 - num_mol*(num_mol-1)/2 + (num_mol-i)*((num_mol-i)-1)/2)
+
+        if i < num_mol1:
+            mol_i_atom_type = atom_type_single_mol1
+            mol_i_position = mol1_positions[i]
+            mol_i_velocity = mol1_velocities[i]
+        else:
+            mol_i_atom_type = atom_type_single_mol2
+            mol_i_position = mol2_positions[i - num_mol1]
+            mol_i_velocity = mol2_velocities[i - num_mol1]
+
+   
+        if j < num_mol1:
+            mol_j_atom_type = atom_type_single_mol1
+            mol_j_position = mol1_positions[j]
+            mol_j_velocity = mol1_velocities[j]
+        else:
+            mol_j_atom_type = atom_type_single_mol2
+            mol_j_position = mol2_positions[j - num_mol1]
+            mol_j_velocity = mol2_velocities[j - num_mol1]
+
+        # Compute pair potential energy
+        pe = inter_molecular_pe(mol1_position=mol_i_position,
+                                mol2_position=mol_j_position,
+                                mol1_type=mol_i_atom_type,
+                                mol2_type=mol_j_atom_type,
+                                eps=eps,
+                                sig=sig,
+                                q=q,
+                                box_length=box_length,
+                                cutoff=cutoff)
+
+        # potential energy
+        pe_matrix[i, j] = pe
+        pe_matrix[j, i] = pe
+
+        # Only consider pairs with attractive interaction (PE < 0)
+        if pe < 0:
+            # Compute relative kinetic energy
+            ke = relative_ke(mol1_velocity=mol_i_velocity,
+                                mol2_velocity=mol_j_velocity,
+                                mol1_mass=mass[mol_i_atom_type],
+                                mol2_mass=mass[mol_j_atom_type])
+
+            # Check Hill criterion
+            if pe + ke < 0:
+                adj_matrix[i, j] = 1
+                adj_matrix[j, i] = 1  # Enforce symmetry
+
+    return adj_matrix, pe_matrix
+
+
+    
+@nb.njit(parallel=True, fastmath=True)
+def hill_criterion4(mol1_positions, mol2_positions, mol1_velocities, mol2_velocities,
+                   atom_type_single_mol1, atom_type_single_mol2, eps, sig, q, mass,
+                   box_length, cutoff):
+    num_mol1 = mol1_positions.shape[0]
+    num_mol2 = mol2_positions.shape[0]
+    num_mol = num_mol1 + num_mol2
+    
+    # Total mass of each molecule
+    m1 = np.sum(mass[atom_type_single_mol1])
+    m2 = np.sum(mass[atom_type_single_mol2])
+
+    mol1_com_velocities = get_com_velocity_vectorized(mol1_velocities, mass[atom_type_single_mol1])
+    mol2_com_velocities = get_com_velocity_vectorized(mol2_velocities, mass[atom_type_single_mol2])
+
+    # Initialize adjacency matrix and total potential energy
+    adj_matrix = np.zeros((num_mol, num_mol), dtype=np.bool_)
+    pe_matrix = np.zeros((num_mol, num_mol), dtype=np.float64)
+
+    for i in nb.prange(num_mol):  # Parallelized loop
+        if i < num_mol1:
+            mol_i_atom_type = atom_type_single_mol1
+            mol_i_position = mol1_positions[i]
+            mol_i_com_velocity = mol1_com_velocities[i]
+            mass_i = m1
+        else:
+            mol_i_atom_type = atom_type_single_mol2
+            mol_i_position = mol2_positions[i - num_mol1]
+            mol_i_com_velocity = mol2_com_velocities[i - num_mol1]
+            mass_i = m2
+
+        for j in range(i + 1, num_mol):  # Compute upper triangle only
+            if j < num_mol1:
+                mol_j_atom_type = atom_type_single_mol1
+                mol_j_position = mol1_positions[j]
+                mol_j_com_velocity = mol1_com_velocities[j]
+                mass_j = m1
+            else:
+                mol_j_atom_type = atom_type_single_mol2
+                mol_j_position = mol2_positions[j - num_mol1]
+                mol_j_com_velocity = mol2_com_velocities[j - num_mol1]
+                mass_j = m2
+
+            # Compute pair potential energy
+            pe = inter_molecular_pe(mol1_position=mol_i_position,
+                                    mol2_position=mol_j_position,
+                                    mol1_type=mol_i_atom_type,
+                                    mol2_type=mol_j_atom_type,
+                                    eps=eps,
+                                    sig=sig,
+                                    q=q,
+                                    box_length=box_length,
+                                    cutoff=cutoff)
+
+            # Add to total potential energy
+            # total_pe += pe
+            pe_matrix[i, j] = pe
+            pe_matrix[j, i] = pe
+
+            # Only consider pairs with attractive interaction (PE < 0)
+            if pe < 0:
+                # Compute relative kinetic energy
+                relative_velocity = mol_i_com_velocity - mol_j_com_velocity # Relative velocity
+                miu = (mass_i * mass_j) / (mass_i + mass_j) # Reduced mass
+                ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * bp.g_mol2kg * bp.a_fs2m_s * bp.a_fs2m_s / bp.kcal_mol2j # Relative kinetic energy, unit: kcal_mol
+
+
+                # Check Hill criterion
+                if pe + ke < 0:
+                    adj_matrix[i, j] = 1
+                    adj_matrix[j, i] = 1  # Enforce symmetry
+
+    return adj_matrix, pe_matrix
+
+
