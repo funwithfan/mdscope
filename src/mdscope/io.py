@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import io
 
 def extract_lammps_data(filename, columns=None, filters=None, sort_by=None):
     """
@@ -38,8 +39,8 @@ def extract_lammps_data(filename, columns=None, filters=None, sort_by=None):
     data_lines = lines[start_index:]
     
     # Read data into a DataFrame
-    data = pd.read_csv(pd.io.common.StringIO(''.join(data_lines)), sep=r"\s+", names=column_names)
-    
+    data = pd.read_csv(io.StringIO(''.join(data_lines)), sep=r"\s+", names=column_names)
+
     # Use all columns if not specified
     if columns is None:
         columns = column_names

@@ -29,6 +29,7 @@ Features
 * Extract trajectory of molecular dynamics simulations.
 * Molecular cluster identification.
 * Local entropy fingerprint calculation.
+* X-ray scattering intensity calculation.
 * To be continued...
 
 Credits

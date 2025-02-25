@@ -461,7 +461,7 @@ def hill_criterion2(mol1_positions, mol2_positions, mol1_velocities, mol2_veloci
             # Compute relative kinetic energy
             relative_velocity = mol_i_com_velocity - mol_j_com_velocity # Relative velocity
             miu = (mass_i * mass_j) / (mass_i + mass_j) # Reduced mass
-            ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * bp.g_mol2kg * bp.a_fs2m_s * bp.a_fs2m_s / bp.kcal_mol2j # Relative kinetic energy, unit: kcal_mol
+            ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * g_mol2kg * a_fs2m_s * a_fs2m_s / kcal_mol2j # Relative kinetic energy, unit: kcal_mol
 
             # Check Hill criterion
             if pe + ke < 0:
@@ -602,7 +602,7 @@ def hill_criterion4(mol1_positions, mol2_positions, mol1_velocities, mol2_veloci
                 # Compute relative kinetic energy
                 relative_velocity = mol_i_com_velocity - mol_j_com_velocity # Relative velocity
                 miu = (mass_i * mass_j) / (mass_i + mass_j) # Reduced mass
-                ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * bp.g_mol2kg * bp.a_fs2m_s * bp.a_fs2m_s / bp.kcal_mol2j # Relative kinetic energy, unit: kcal_mol
+                ke = 0.5 * miu * np.dot(relative_velocity, relative_velocity) * g_mol2kg * a_fs2m_s * a_fs2m_s / kcal_mol2j # Relative kinetic energy, unit: kcal_mol
 
 
                 # Check Hill criterion
